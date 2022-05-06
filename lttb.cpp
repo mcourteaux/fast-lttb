@@ -9,12 +9,16 @@ template <typename T>
 static inline uint64_t downsample0(T *in_x, T *in_y, uint64_t len, T *out_x,
                                    T *out_y, uint64_t out_cap,
                                    int bucket_size) {
-  if (bucket_size % 8 || bucket_size <= 0) {
-    throw new std::invalid_argument("bucket_size not a positive multiple of 8");
+  if ((bucket_size % 8) != 0 || bucket_size <= 0) {
+    throw std::invalid_argument("bucket_size not a positive multiple of 8");
   }
-  int num_full_buckets = (len - 2) / bucket_size;
-  if (num_full_buckets > out_cap) {
-    throw new std::invalid_argument("out_cap not big enough");
+  uint64_t num_full_buckets = (len - 2) / bucket_size;
+  std::printf("len: %lu\n", len);
+  std::printf("bucket_size: %d\n", bucket_size);
+  std::printf("out_cap: %lu\n", out_cap);
+  std::printf("buckets: %lu\n", num_full_buckets);
+  if (num_full_buckets + 2 > out_cap) {
+    throw std::invalid_argument("out_cap not big enough");
   }
 
   T last_x = 0;
@@ -50,7 +54,7 @@ static inline uint64_t downsample0(T *in_x, T *in_y, uint64_t len, T *out_x,
       if (in_x) {
         next_x /= bucket_size;
       } else {
-        next_x = bucket_size + bucket_size >> 1;
+        next_x = bucket_size + (bucket_size >> 1);
       }
       next_y /= bucket_size;
     } else {
