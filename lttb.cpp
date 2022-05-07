@@ -34,6 +34,7 @@ static inline uint64_t downsample0(T *in_x, T *in_y, uint64_t len, T *out_x,
   T last_y = in_y[0];
   out_y[0] = last_y;
   out_y++;
+  in_y++;
 
   for (uint64_t bi = 0; bi < num_full_buckets; ++bi) {
     short best_si = 0;
@@ -127,9 +128,9 @@ static inline uint64_t downsample0(T *in_x, T *in_y, uint64_t len, T *out_x,
     } else {
       last_x = len - 1;
     }
-    out_x[num_full_buckets + 1] = last_x;
+    out_x[num_full_buckets] = last_x;
   }
-  out_y[num_full_buckets + 1] = in_y[last_elem_idx];
+  out_y[num_full_buckets] = in_y[last_elem_idx];
 
   return num_full_buckets + 2;
 }
