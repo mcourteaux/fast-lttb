@@ -144,6 +144,17 @@ TYPED_TEST(FastLTTB, Timing100M_Scalar) {
       lttb::downsample(test_x, test_y, 100000000, out_x, out_y, len, 1024);
 }
 
+TYPED_TEST(FastLTTB, Timing100M_NoX_Scalar) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
+  int out_len =
+      lttb::downsample(nullptr, test_y, 100000000, out_x, out_y, len, 1024);
+}
+
 TYPED_TEST(FastLTTB, Timing100M_SIMD) {
   auto test_x = this->test_x;
   auto test_y = this->test_y;
@@ -153,6 +164,17 @@ TYPED_TEST(FastLTTB, Timing100M_SIMD) {
 
   int out_len =
       lttb::downsample_simd(test_x, test_y, 100000000, out_x, out_y, len, 1024);
+}
+
+TYPED_TEST(FastLTTB, Timing100M_NoX_SIMD) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
+  int out_len =
+      lttb::downsample_simd(nullptr, test_y, 100000000, out_x, out_y, len, 1024);
 }
 
 TYPED_TEST(FastLTTB, SIMDCorrect) {
