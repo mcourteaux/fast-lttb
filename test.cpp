@@ -5,7 +5,7 @@
 #include <fstream>
 #include <lttb.hpp>
 
-// The fixture for testing class Foo.
+template <typename T>
 class FastLTTB : public ::testing::Test {
  protected:
   FastLTTB() {}
@@ -14,10 +14,10 @@ class FastLTTB : public ::testing::Test {
 
   static void SetUpTestCase() {
     len = 100000000UL;  // 100 mil
-    test_x = new double[len];
-    test_y = new double[len];
+    test_x = new T[len];
+    test_y = new T[len];
 
-    std::printf("Generating dummy data...\n");
+    std::printf("Generating dummy f%d data...\n", int(sizeof(T) * 8));
     constexpr int lut_size = 2048;
     float sin_lut[lut_size];
     for (int i = 0; i < lut_size; ++i) {
@@ -42,8 +42,8 @@ class FastLTTB : public ::testing::Test {
 
   void SetUp() override {
     out_cap = len / 8 + 2;
-    out_x = new double[out_cap];
-    out_y = new double[out_cap];
+    out_x = new T[out_cap];
+    out_y = new T[out_cap];
   }
 
   void TearDown() override {
@@ -51,26 +51,40 @@ class FastLTTB : public ::testing::Test {
     delete[] out_y;
   }
 
-  void write_output(std::string fname, uint64_t out_len) {
+  void write_output(std::string fname, uint64_t out_len, uint64_t offset = 0) {
     std::printf("Writing %s with %lu entries.\n", fname.c_str(), out_len);
     std::ofstream file(fname);
     for (uint64_t i = 0; i < out_len; ++i) {
-      file << out_x[i] << "," << out_y[i] << "\n";
+      file << out_x[i + offset] << "," << out_y[i + offset] << "\n";
     }
     file.close();
   }
 
  public:
   static uint64_t len;
-  static double *test_x, *test_y;
+  static T *test_x, *test_y;
+
   uint64_t out_cap;
-  double *out_x, *out_y;
+  T *out_x, *out_y;
 };
 
-uint64_t FastLTTB::len;
-double *FastLTTB::test_x, *FastLTTB::test_y;
+template <typename T>
+uint64_t FastLTTB<T>::len;
+template <typename T>
+T *FastLTTB<T>::test_x;
+template <typename T>
+T *FastLTTB<T>::test_y;
 
-TEST_F(FastLTTB, Correct_I100_B1024) {
+typedef ::testing::Types<float, double> FloatTypes;
+TYPED_TEST_SUITE(FastLTTB, FloatTypes);
+
+TYPED_TEST(FastLTTB, Correct_I100_B1024_Scalar) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
   int out_len = lttb::downsample(test_x, test_y, 100, out_x, out_y, len, 1024);
   ASSERT_EQ(out_len, 2);
   ASSERT_EQ(out_x[0], test_x[0]);
@@ -79,32 +93,99 @@ TEST_F(FastLTTB, Correct_I100_B1024) {
   ASSERT_EQ(out_y[1], test_y[99]);
 }
 
-TEST_F(FastLTTB, Works1K) {
-  int out_len = lttb::downsample(test_x, test_y, 1000, out_x, out_y, len, 1024);
+TYPED_TEST(FastLTTB, Correct_I100_B1024_SIMD) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
+  int out_len =
+      lttb::downsample_simd(test_x, test_y, 100, out_x, out_y, len, 1024);
   ASSERT_EQ(out_len, 2);
+  ASSERT_EQ(out_x[0], test_x[0]);
+  ASSERT_EQ(out_x[1], test_x[99]);
+  ASSERT_EQ(out_y[0], test_y[0]);
+  ASSERT_EQ(out_y[1], test_y[99]);
 }
 
-TEST_F(FastLTTB, EndPoints) {
+TYPED_TEST(FastLTTB, EndPoints_Scalar) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
   int out_len =
       lttb::downsample(test_x, test_y, 10000, out_x, out_y, len, 1024);
   ASSERT_NE(out_x[0], out_x[out_len - 1]);
 }
 
-TEST_F(FastLTTB, Works1M) {
-  int out_len;
-  out_len = lttb::downsample(test_x, test_y, 1000000, out_x, out_y, len, 1024);
-  write_output("ds_1m_1024.csv", out_len);
-  out_len = lttb::downsample(test_x, test_y, 1000000, out_x, out_y, len, 10240);
-  write_output("ds_1m_10240.csv", out_len);
-}
+TYPED_TEST(FastLTTB, EndPoints_SIMD) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
 
-TEST_F(FastLTTB, Works10M) {
   int out_len =
-      lttb::downsample(test_x, test_y, 10000000, out_x, out_y, len, 1024);
-  write_output("ds_10m.csv", out_len);
+      lttb::downsample_simd(test_x, test_y, 10000, out_x, out_y, len, 1024);
+  ASSERT_NE(out_x[0], out_x[out_len - 1]);
 }
 
-TEST_F(FastLTTB, Works100M) {
+TYPED_TEST(FastLTTB, Timing100M_Scalar) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
   int out_len =
       lttb::downsample(test_x, test_y, 100000000, out_x, out_y, len, 1024);
+}
+
+TYPED_TEST(FastLTTB, Timing100M_SIMD) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
+  int out_len =
+      lttb::downsample_simd(test_x, test_y, 100000000, out_x, out_y, len, 1024);
+}
+
+TYPED_TEST(FastLTTB, SIMDCorrect) {
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
+  uint64_t size = 100000;
+  int bs = 1024;
+  auto *out_x_1 = out_x;
+  auto *out_y_1 = out_y;
+  auto *out_x_2 = out_x + size;
+  auto *out_y_2 = out_y + size;
+
+  // Generate reference
+  int out_len_ref =
+      lttb::downsample(test_x, test_y, size, out_x_1, out_y_1, len, 8);
+  this->write_output("input.csv", out_len_ref);
+
+  int out_len_1 =
+      lttb::downsample(test_x, test_y, size, out_x_1, out_y_1, len, bs);
+  int out_len_2 =
+      lttb::downsample_simd(test_x, test_y, size, out_x_2, out_y_2, len, bs);
+
+  this->write_output("output_scalar.csv", out_len_1, 0);
+  this->write_output("output_simd.csv", out_len_2, size);
+
+  ASSERT_EQ(out_len_1, out_len_2);
+
+  for (uint64_t i = 0; i < out_len_1; ++i) {
+    EXPECT_EQ(out_x_1[i], out_x_2[i]) << "i=" << i << ", out_len=" << out_len_1;
+    ASSERT_EQ(out_y_1[i], out_y_2[i]) << "i=" << i << ", out_len=" << out_len_1;
+  }
 }

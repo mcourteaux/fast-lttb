@@ -8,17 +8,13 @@
 namespace lttb {
 
 template <typename T>
-static inline uint64_t downsample0(T *in_x, T *in_y, uint64_t len, T *out_x,
-                                   T *out_y, uint64_t out_cap,
+static inline uint64_t downsample0(const T *in_x, const T *in_y, uint64_t len,
+                                   T *out_x, T *out_y, uint64_t out_cap,
                                    int bucket_size) {
   if ((bucket_size % 8) != 0 || bucket_size <= 0) {
     throw std::invalid_argument("bucket_size not a positive multiple of 8");
   }
   uint64_t num_full_buckets = (len - 2) / bucket_size;
-  std::printf("len: %lu\n", len);
-  std::printf("bucket_size: %d\n", bucket_size);
-  std::printf("out_cap: %lu\n", out_cap);
-  std::printf("buckets: %lu\n", num_full_buckets);
   if (num_full_buckets + 2 > out_cap) {
     throw std::invalid_argument("out_cap not big enough");
   }
@@ -96,7 +92,7 @@ static inline uint64_t downsample0(T *in_x, T *in_y, uint64_t len, T *out_x,
       T d2_y = next_y - last_y;
       T surf = std::abs(d1_x * d2_y - d1_y * d1_x);
 
-      if (surf > largest_surface) {
+      if (surf >= largest_surface) {
         largest_surface = surf;
         best_x = cand_x;
         best_y = cand_y;
@@ -147,7 +143,7 @@ struct simd<float> {
   static constexpr int size = 8;
   static inline type zero() { return _mm256_setzero_ps(); }
   static inline type splat(float v) { return _mm256_set1_ps(v); }
-  static inline type load(float *d) { return _mm256_loadu_ps(d); }
+  static inline type load(const float *d) { return _mm256_loadu_ps(d); }
   static inline type add(type a, type b) { return _mm256_add_ps(a, b); }
   static inline type mul(type a, type b) { return _mm256_mul_ps(a, b); }
   static inline type abs(type a) {
@@ -155,6 +151,15 @@ struct simd<float> {
   }
   static inline type blend(type a, type b, type mask) {
     return _mm256_blendv_ps(a, b, mask);
+  }
+
+  static inline type hadd_vec(type a) {
+    auto x = _mm256_permute2f128_ps(a, a, 1);
+    auto y = _mm256_add_ps(a, x);
+    x = _mm256_shuffle_ps(y, y, _MM_SHUFFLE(2, 3, 0, 1));
+    x = _mm256_add_ps(x, y);
+    y = _mm256_shuffle_ps(x, x, _MM_SHUFFLE(1, 0, 3, 2));
+    return _mm256_add_ps(x, y);
   }
 
   template <int _cmp>
@@ -170,7 +175,7 @@ struct simd<double> {
   static constexpr int size = 4;
   static inline type zero() { return _mm256_setzero_pd(); }
   static inline type splat(double v) { return _mm256_set1_pd(v); }
-  static inline type load(double *d) { return _mm256_loadu_pd(d); }
+  static inline type load(const double *d) { return _mm256_loadu_pd(d); }
   static inline type add(type a, type b) { return _mm256_add_pd(a, b); }
   static inline type mul(type a, type b) { return _mm256_mul_pd(a, b); }
   static inline type abs(type a) {
@@ -178,6 +183,12 @@ struct simd<double> {
   }
   static inline type blend(type a, type b, type mask) {
     return _mm256_blendv_pd(a, b, mask);
+  }
+  static inline type hadd_vec(type a) {
+    a = _mm256_hadd_pd(a, _mm256_permute2f128_pd(a, a, 1));
+    // a = [ a0 + a1, a2 + a3, a2 + a3, a0 + a1 ]
+    a = _mm256_hadd_pd(a, a);
+    return a;
   }
 
   template <int _cmp>
@@ -187,17 +198,13 @@ struct simd<double> {
 };
 
 template <typename T>
-static inline uint64_t downsample0_simd(T *in_x, T *in_y, uint64_t len,
-                                        T *out_x, T *out_y, uint64_t out_cap,
-                                        int bucket_size) {
+static inline uint64_t downsample0_simd(const T *in_x, const T *in_y,
+                                        uint64_t len, T *out_x, T *out_y,
+                                        uint64_t out_cap, int bucket_size) {
   if ((bucket_size % 8) != 0 || bucket_size <= 0) {
     throw std::invalid_argument("bucket_size not a positive multiple of 8");
   }
   uint64_t num_full_buckets = (len - 2) / bucket_size;
-  std::printf("len: %lu\n", len);
-  std::printf("bucket_size: %d\n", bucket_size);
-  std::printf("out_cap: %lu\n", out_cap);
-  std::printf("buckets: %lu\n", num_full_buckets);
   if (num_full_buckets + 2 > out_cap) {
     throw std::invalid_argument("out_cap not big enough");
   }
@@ -242,10 +249,12 @@ static inline uint64_t downsample0_simd(T *in_x, T *in_y, uint64_t len,
         }
       }
       if (in_x) {
+        next_x = simd<T>::hadd_vec(next_x);
         next_x = simd<T>::mul(next_x, simd<T>::splat(1.0f / bucket_size));
       } else {
         next_x = simd<T>::splat(bucket_size + (bucket_size >> 1));
       }
+      next_y = simd<T>::hadd_vec(next_y);
       next_y = simd<T>::mul(next_y, simd<T>::splat(1.0f / bucket_size));
     } else {
       // There is no next full bucket. Let's take the last one
@@ -264,9 +273,9 @@ static inline uint64_t downsample0_simd(T *in_x, T *in_y, uint64_t len,
     vec_t v_best_y = simd<T>::zero();
     __m256i v_si;
     if constexpr (sizeof(T) == 4) {
-      v_si = _mm256_loadu_si256((const __m256i*) ramp_i64_data);
+      v_si = _mm256_loadu_si256((const __m256i *)ramp_i64_data);
     } else if constexpr (sizeof(T) == 8) {
-      v_si = _mm256_loadu_si256((const __m256i*) ramp_i32_data);
+      v_si = _mm256_loadu_si256((const __m256i *)ramp_i32_data);
     }
     for (short si = 0; si < bucket_size; si += simd<T>::size) {
       // Take x,y coordinate of candidate
@@ -278,7 +287,7 @@ static inline uint64_t downsample0_simd(T *in_x, T *in_y, uint64_t len,
         if constexpr (sizeof(T) == 4) {
           cand_x = simd<T>::splat(bi * bucket_size + si) +
                    simd<T>::load(ramp_f32_data);
-        } else {
+        } else if constexpr (sizeof(T) == 8) {
           cand_x = simd<T>::splat(bi * bucket_size + si) +
                    simd<T>::load(ramp_f64_data);
         }
@@ -300,7 +309,7 @@ static inline uint64_t downsample0_simd(T *in_x, T *in_y, uint64_t len,
       vec_t d2_y = next_y - last_y;
       vec_t surf = simd<T>::abs(d1_x * d2_y - d1_y * d1_x);
 
-      vec_t comp = simd<T>::template cmp<_CMP_GT_OQ>(surf, v_largest_surface);
+      vec_t comp = simd<T>::template cmp<_CMP_GE_OQ>(surf, v_largest_surface);
       v_largest_surface = simd<T>::blend(v_largest_surface, surf, comp);
       v_best_x = simd<T>::blend(v_best_x, cand_x, comp);
       v_best_y = simd<T>::blend(v_best_y, cand_y, comp);
@@ -311,7 +320,7 @@ static inline uint64_t downsample0_simd(T *in_x, T *in_y, uint64_t len,
     T surfaces_array[simd<T>::size];
     T best_x_array[simd<T>::size];
     T best_y_array[simd<T>::size];
-    T largest_surface = 0;
+    T largest_surface = -1;
     typename simd<T>::signed_int indices_array[simd<T>::size];
     if constexpr (sizeof(T) == sizeof(float)) {
       _mm256_storeu_ps(surfaces_array, v_largest_surface);
@@ -324,12 +333,13 @@ static inline uint64_t downsample0_simd(T *in_x, T *in_y, uint64_t len,
     }
     for (int i = 0; i < simd<T>::size; ++i) {
       T s = surfaces_array[i];
-      if (s > largest_surface) {
+      if (s >= largest_surface) {
+        largest_surface = s;
         best_x = best_x_array[i];
         best_y = best_y_array[i];
       }
     }
-    
+
     // Produce an output
     if (out_x) out_x[bi] = best_x;
     out_y[bi] = best_y;
@@ -367,14 +377,25 @@ static inline uint64_t downsample0_simd(T *in_x, T *in_y, uint64_t len,
   return num_full_buckets + 2;
 }
 
-uint64_t downsample(float *x, float *y, uint64_t len, float *out_x,
+uint64_t downsample(const float *x, const float *y, uint64_t len, float *out_x,
                     float *out_y, uint64_t out_cap, int bucket_size = -1) {
-  // return downsample0<float>(x, y, len, out_x, out_y, out_cap, bucket_size);
+  return downsample0<float>(x, y, len, out_x, out_y, out_cap, bucket_size);
+}
+uint64_t downsample(const double *x, const double *y, uint64_t len,
+                    double *out_x, double *out_y, uint64_t out_cap,
+                    int bucket_size = -1) {
+  return downsample0<double>(x, y, len, out_x, out_y, out_cap, bucket_size);
+}
+
+uint64_t downsample_simd(const float *x, const float *y, uint64_t len,
+                         float *out_x, float *out_y, uint64_t out_cap,
+                         int bucket_size = -1) {
   return downsample0_simd<float>(x, y, len, out_x, out_y, out_cap, bucket_size);
 }
-uint64_t downsample(double *x, double *y, uint64_t len, double *out_x,
-                    double *out_y, uint64_t out_cap, int bucket_size = -1) {
-  //return downsample0<double>(x, y, len, out_x, out_y, out_cap, bucket_size);
-  return downsample0_simd<double>(x, y, len, out_x, out_y, out_cap, bucket_size);
+uint64_t downsample_simd(const double *x, const double *y, uint64_t len,
+                         double *out_x, double *out_y, uint64_t out_cap,
+                         int bucket_size = -1) {
+  return downsample0_simd<double>(x, y, len, out_x, out_y, out_cap,
+                                  bucket_size);
 }
 }  // namespace lttb
