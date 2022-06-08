@@ -2,13 +2,14 @@
 #include "lttb.hpp"
 
 #include <immintrin.h>
+#include <Tracy.hpp>
 
 #include <stdexcept>
 
 namespace lttb {
 
 template <typename T>
-static inline uint64_t downsample0(const T *in_x, const T *in_y, uint64_t len,
+static uint64_t downsample0(const T *in_x, const T *in_y, uint64_t len,
                                    T *out_x, T *out_y, uint64_t out_cap,
                                    int bucket_size) {
   if ((bucket_size % 8) != 0 || bucket_size <= 0) {
@@ -26,8 +27,8 @@ static inline uint64_t downsample0(const T *in_x, const T *in_y, uint64_t len,
   }
   if (out_x) {
     out_x[0] = last_x;
+    out_x++;
   }
-  out_x++;
 
   T last_y = in_y[0];
   out_y[0] = last_y;
@@ -39,7 +40,7 @@ static inline uint64_t downsample0(const T *in_x, const T *in_y, uint64_t len,
     T next_y = 0;
     if (bi + 1 < num_full_buckets) {
       // Compute average of next bucket.
-      for (short si = 0; si < bucket_size; ++si) {
+      for (uint32_t si = 0; si < bucket_size; ++si) {
         next_y += in_y[bucket_size + si];
         if (in_x) {
           next_x += in_x[bucket_size + si];
@@ -66,7 +67,7 @@ static inline uint64_t downsample0(const T *in_x, const T *in_y, uint64_t len,
     T largest_surface = 0;
     T best_x = 0;
     T best_y = 0;
-    for (short si = 0; si < bucket_size; ++si) {
+    for (uint32_t si = 0; si < bucket_size; ++si) {
       // Take x,y coordinate of candidate
       T cand_y = in_y[si];
       T cand_x = 0;
@@ -136,6 +137,7 @@ struct simd {
   static constexpr int size = 0;
 };
 
+#if 1
 template <>
 struct simd<float> {
   typedef __m256 type;
@@ -167,6 +169,38 @@ struct simd<float> {
     return _mm256_cmp_ps(a, b, _cmp);
   }
 };
+#else
+template <>
+struct simd<float> {
+  typedef __m128 type;
+  typedef int32_t signed_int;
+  static constexpr int size = 4;
+  static inline type zero() { return _mm_setzero_ps(); }
+  static inline type splat(float v) { return _mm_set1_ps(v); }
+  static inline type load(const float *d) { return _mm_loadu_ps(d); }
+  static inline type add(type a, type b) { return _mm_add_ps(a, b); }
+  static inline type mul(type a, type b) { return _mm_mul_ps(a, b); }
+  static inline type abs(type a) {
+    return _mm_max_ps(a, _mm_sub_ps(zero(), a));
+  }
+  static inline type blend(type a, type b, type mask) {
+    return _mm_blendv_ps(a, b, mask);
+  }
+
+  static inline type hadd_vec(type a) {
+    type shuf = _mm_movehdup_ps(a);
+    type sums = _mm_add_ps(a, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    return _mm_broadcastss_ps(sums);
+  }
+
+  template <int _cmp>
+  static inline type cmp(type a, type b) {
+    return _mm_cmp_ps(a, b, _cmp);
+  }
+};
+#endif
 
 template <>
 struct simd<double> {
@@ -198,7 +232,7 @@ struct simd<double> {
 };
 
 template <typename T>
-static inline uint64_t downsample0_simd(const T *in_x, const T *in_y,
+static uint64_t downsample0_simd(const T *in_x, const T *in_y,
                                         uint64_t len, T *out_x, T *out_y,
                                         uint64_t out_cap, int bucket_size) {
   if ((bucket_size % 8) != 0 || bucket_size <= 0) {
@@ -237,12 +271,14 @@ static inline uint64_t downsample0_simd(const T *in_x, const T *in_y,
     ramp_i64_data[i] = i;
   }
 
+  vec_t inv_bucket_size = simd<T>::splat(1.0 / bucket_size);
+
   for (uint64_t bi = 0; bi < num_full_buckets; ++bi) {
     vec_t next_x = simd<T>::zero();
     vec_t next_y = simd<T>::zero();
     if (bi + 1 < num_full_buckets) {
       // Compute average of next bucket.
-      for (short si = 0; si < bucket_size; si += simd<T>::size) {
+      for (uint32_t si = 0; si < bucket_size; si += simd<T>::size) {
         next_y = simd<T>::add(next_y, simd<T>::load(&in_y[bucket_size + si]));
         if (in_x) {
           next_x = simd<T>::add(next_x, simd<T>::load(&in_x[bucket_size + si]));
@@ -250,12 +286,12 @@ static inline uint64_t downsample0_simd(const T *in_x, const T *in_y,
       }
       if (in_x) {
         next_x = simd<T>::hadd_vec(next_x);
-        next_x = simd<T>::mul(next_x, simd<T>::splat(1.0f / bucket_size));
+        next_x = simd<T>::mul(next_x, inv_bucket_size);
       } else {
         next_x = simd<T>::splat(bucket_size + (bucket_size >> 1));
       }
       next_y = simd<T>::hadd_vec(next_y);
-      next_y = simd<T>::mul(next_y, simd<T>::splat(1.0f / bucket_size));
+      next_y = simd<T>::mul(next_y, inv_bucket_size);
     } else {
       // There is no next full bucket. Let's take the last one
       int last_elem_idx = len - num_full_buckets * bucket_size -
@@ -271,13 +307,7 @@ static inline uint64_t downsample0_simd(const T *in_x, const T *in_y,
     vec_t v_largest_surface = simd<T>::zero();
     vec_t v_best_x = simd<T>::zero();
     vec_t v_best_y = simd<T>::zero();
-    __m256i v_si;
-    if constexpr (sizeof(T) == 4) {
-      v_si = _mm256_loadu_si256((const __m256i *)ramp_i64_data);
-    } else if constexpr (sizeof(T) == 8) {
-      v_si = _mm256_loadu_si256((const __m256i *)ramp_i32_data);
-    }
-    for (short si = 0; si < bucket_size; si += simd<T>::size) {
+    for (uint32_t si = 0; si < bucket_size; si += simd<T>::size) {
       // Take x,y coordinate of candidate
       vec_t cand_y = simd<T>::load(&in_y[si]);
       vec_t cand_x = simd<T>::zero();
@@ -322,10 +352,14 @@ static inline uint64_t downsample0_simd(const T *in_x, const T *in_y,
     T best_y_array[simd<T>::size];
     T largest_surface = -1;
     typename simd<T>::signed_int indices_array[simd<T>::size];
-    if constexpr (sizeof(T) == sizeof(float)) {
+    if constexpr (std::is_same_v<T, float> && simd<T>::size == 8) {
       _mm256_storeu_ps(surfaces_array, v_largest_surface);
       _mm256_storeu_ps(best_x_array, v_best_x);
       _mm256_storeu_ps(best_y_array, v_best_y);
+    } if constexpr (std::is_same_v<T, float> && simd<T>::size == 4) {
+      _mm_storeu_ps(surfaces_array, v_largest_surface);
+      _mm_storeu_ps(best_x_array, v_best_x);
+      _mm_storeu_ps(best_y_array, v_best_y);
     } else if constexpr (sizeof(T) == sizeof(double)) {
       _mm256_storeu_pd(surfaces_array, v_largest_surface);
       _mm256_storeu_pd(best_x_array, v_best_x);
@@ -354,12 +388,6 @@ static inline uint64_t downsample0_simd(const T *in_x, const T *in_y,
       last_x -= bucket_size;
     }
     in_y += bucket_size;
-
-    if constexpr (sizeof(T) == 4) {
-      v_si = _mm256_add_epi64(v_si, _mm256_set1_epi64x(4));
-    } else if constexpr (sizeof(T) == 8) {
-      v_si = _mm256_add_epi32(v_si, _mm256_set1_epi32(8));
-    }
   }
 
   // Just store the last element.
@@ -379,22 +407,26 @@ static inline uint64_t downsample0_simd(const T *in_x, const T *in_y,
 
 uint64_t downsample(const float *x, const float *y, uint64_t len, float *out_x,
                     float *out_y, uint64_t out_cap, int bucket_size = -1) {
+  //ZoneScoped;
   return downsample0<float>(x, y, len, out_x, out_y, out_cap, bucket_size);
 }
 uint64_t downsample(const double *x, const double *y, uint64_t len,
                     double *out_x, double *out_y, uint64_t out_cap,
                     int bucket_size = -1) {
+  //ZoneScoped;
   return downsample0<double>(x, y, len, out_x, out_y, out_cap, bucket_size);
 }
 
 uint64_t downsample_simd(const float *x, const float *y, uint64_t len,
                          float *out_x, float *out_y, uint64_t out_cap,
                          int bucket_size = -1) {
+  //ZoneScoped;
   return downsample0_simd<float>(x, y, len, out_x, out_y, out_cap, bucket_size);
 }
 uint64_t downsample_simd(const double *x, const double *y, uint64_t len,
                          double *out_x, double *out_y, uint64_t out_cap,
                          int bucket_size = -1) {
+  //ZoneScoped;
   return downsample0_simd<double>(x, y, len, out_x, out_y, out_cap,
                                   bucket_size);
 }

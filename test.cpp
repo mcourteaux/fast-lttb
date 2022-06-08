@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <Tracy.hpp>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -13,6 +14,7 @@ class FastLTTB : public ::testing::Test {
   ~FastLTTB() override {}
 
   static void SetUpTestCase() {
+    ZoneScoped;
     len = 100000000UL;  // 100 mil
     test_x = new T[len];
     test_y = new T[len];
@@ -52,6 +54,7 @@ class FastLTTB : public ::testing::Test {
   }
 
   void write_output(std::string fname, uint64_t out_len, uint64_t offset = 0) {
+    ZoneScoped;
     std::printf("Writing %s with %lu entries.\n", fname.c_str(), out_len);
     std::ofstream file(fname);
     for (uint64_t i = 0; i < out_len; ++i) {
@@ -134,6 +137,7 @@ TYPED_TEST(FastLTTB, EndPoints_SIMD) {
 }
 
 TYPED_TEST(FastLTTB, Timing100M_Scalar) {
+  ZoneScoped;
   auto test_x = this->test_x;
   auto test_y = this->test_y;
   auto out_x = this->out_x;
@@ -145,6 +149,7 @@ TYPED_TEST(FastLTTB, Timing100M_Scalar) {
 }
 
 TYPED_TEST(FastLTTB, Timing100M_NoX_Scalar) {
+  ZoneScoped;
   auto test_x = this->test_x;
   auto test_y = this->test_y;
   auto out_x = this->out_x;
@@ -156,6 +161,7 @@ TYPED_TEST(FastLTTB, Timing100M_NoX_Scalar) {
 }
 
 TYPED_TEST(FastLTTB, Timing100M_SIMD) {
+  ZoneScoped;
   auto test_x = this->test_x;
   auto test_y = this->test_y;
   auto out_x = this->out_x;
@@ -166,18 +172,91 @@ TYPED_TEST(FastLTTB, Timing100M_SIMD) {
       lttb::downsample_simd(test_x, test_y, 100000000, out_x, out_y, len, 1024);
 }
 
-TYPED_TEST(FastLTTB, Timing100M_NoX_SIMD) {
+TYPED_TEST(FastLTTB, Speedup10M_10Reps) {
+  ZoneScoped;
   auto test_x = this->test_x;
   auto test_y = this->test_y;
   auto out_x = this->out_x;
   auto out_y = this->out_y;
   auto len = this->len;
 
-  int out_len =
-      lttb::downsample_simd(nullptr, test_y, 100000000, out_x, out_y, len, 1024);
+  const int reps = 10;
+  constexpr uint64_t num_samples = 10000000;
+
+  for (int use_x = 0; use_x < 2; ++use_x) {
+    ZoneScopedN("UseX");
+    ZoneValue(use_x);
+    for (int bucket_size = 16; bucket_size < 1 << 16; bucket_size <<= 1) {
+      double timing_simd = 0.0;
+      double timing_scalar = 0.0;
+      {
+        auto start = std::chrono::high_resolution_clock::now();
+        ZoneScopedN("SIMD");
+        for (int i = 0; i < reps; ++i) {
+          ZoneScoped;
+          int out_len;
+          if (use_x != 0) {
+            out_len = lttb::downsample_simd(test_x, test_y, num_samples, out_x,
+                                            out_y, len, bucket_size);
+          } else {
+            out_len = lttb::downsample_simd(nullptr, test_y, num_samples, out_x,
+                                            out_y, len, bucket_size);
+          }
+          ASSERT_NE(out_len, 0);
+        }
+        auto stop = std::chrono::high_resolution_clock::now();
+        timing_simd =
+            std::chrono::duration_cast<
+                std::chrono::duration<double, std::milli>>(stop - start)
+                .count() /
+            reps;
+      }
+      {
+        auto start = std::chrono::high_resolution_clock::now();
+        ZoneScopedN("Scalar");
+        for (int i = 0; i < reps; ++i) {
+          ZoneScoped;
+          int out_len;
+          if (use_x != 0) {
+            out_len = lttb::downsample(test_x, test_y, num_samples, out_x,
+                                       out_y, len, bucket_size);
+          } else {
+            out_len = lttb::downsample(nullptr, test_y, num_samples, out_x,
+                                       out_y, len, bucket_size);
+          }
+          ASSERT_NE(out_len, 0);
+        }
+        auto stop = std::chrono::high_resolution_clock::now();
+        timing_scalar =
+            std::chrono::duration_cast<
+                std::chrono::duration<double, std::milli>>(stop - start)
+                .count() /
+            reps;
+      }
+
+      std::printf(
+          "Speedup [bucket size %5d | %10s]: x%.2f  (simd=%8.2f ms; "
+          "scalar=%8.2f ms)\n",
+          bucket_size, use_x ? "with x" : "without x",
+          timing_scalar / timing_simd, timing_simd, timing_scalar);
+    }
+  }
+}
+
+TYPED_TEST(FastLTTB, Timing100M_NoX_SIMD) {
+  ZoneScoped;
+  auto test_x = this->test_x;
+  auto test_y = this->test_y;
+  auto out_x = this->out_x;
+  auto out_y = this->out_y;
+  auto len = this->len;
+
+  int out_len = lttb::downsample_simd(nullptr, test_y, 100000000, out_x, out_y,
+                                      len, 1024);
 }
 
 TYPED_TEST(FastLTTB, SIMDCorrect) {
+  ZoneScoped;
   auto test_x = this->test_x;
   auto test_y = this->test_y;
   auto out_x = this->out_x;
