@@ -2,16 +2,16 @@
 #include "lttb.hpp"
 
 #include <immintrin.h>
-#include <Tracy.hpp>
 
+#include <Tracy.hpp>
 #include <stdexcept>
 
 namespace lttb {
 
 template <typename T>
 static uint64_t downsample0(const T *in_x, const T *in_y, uint64_t len,
-                                   T *out_x, T *out_y, uint64_t out_cap,
-                                   int bucket_size) {
+                            T *out_x, T *out_y, uint64_t out_cap,
+                            int bucket_size) {
   if ((bucket_size % 8) != 0 || bucket_size <= 0) {
     throw std::invalid_argument("bucket_size not a positive multiple of 8");
   }
@@ -164,6 +164,36 @@ struct simd<float> {
     return _mm256_add_ps(x, y);
   }
 
+  static inline type hmax_vec(type a) {
+    type max = a;
+    a = _mm256_permute2f128_ps(max, max, 1);
+    max = _mm256_max_ps(max, a);  // max(lower 128, upper 128)
+    a = _mm256_shuffle_ps(max, max, _MM_SHUFFLE(2, 3, 0, 1));
+    max = _mm256_max_ps(max, a);
+    a = _mm256_shuffle_ps(max, max, _MM_SHUFFLE(1, 0, 2, 3));
+    max = _mm256_max_ps(max, a);
+    return max;
+  }
+
+  static inline int index_of_elem(type a, float e) {
+    type mask = _mm256_cmp_ps(a, _mm256_set1_ps(e), _CMP_EQ_OS);
+    int move = _mm256_movemask_ps(mask);
+    return __builtin_ctz(move);
+  }
+
+  static inline int index_of_match(type a, type e) {
+    type mask = _mm256_cmp_ps(a, e, _CMP_EQ_OS);
+    int move = _mm256_movemask_ps(mask);
+    return __builtin_ctz(move);
+  }
+
+  static inline float extract(type a, int index) {
+    __m128i vidx = _mm_cvtsi32_si128(index);                 // vmovd
+    __m256i vidx256 = _mm256_castsi128_si256(vidx);          // no instructions
+    __m256 shuffled = _mm256_permutevar8x32_ps(a, vidx256);  // vpermps
+    return _mm256_cvtss_f32(shuffled);
+  }
+
   template <int _cmp>
   static inline type cmp(type a, type b) {
     return _mm256_cmp_ps(a, b, _cmp);
@@ -225,6 +255,40 @@ struct simd<double> {
     return a;
   }
 
+  static inline type hmax_vec(type a) {
+    type max = a;
+    a = _mm256_permute2f128_pd(max, max, 1);
+    max = _mm256_max_pd(max, a);
+    a = _mm256_shuffle_pd(max, max, _MM_SHUFFLE2(0, 1));
+    max = _mm256_max_pd(max, a);
+    return max;
+  }
+
+  static inline int index_of_elem(type a, double e) {
+    type mask = _mm256_cmp_pd(a, _mm256_set1_pd(e), _CMP_EQ_OS);
+    int move = _mm256_movemask_pd(mask);
+    return __builtin_ctz(move);
+  }
+
+  static inline int index_of_match(type a, type e) {
+    type mask = _mm256_cmp_pd(a, e, _CMP_EQ_OS);
+    int move = _mm256_movemask_pd(mask);
+    return __builtin_ctz(move);
+  }
+
+  static inline double extract(type a, int index) {
+#if 0 // TODO still wrong the permutevar
+    __m128i vidx = _mm_cvtsi32_si128(index);             // vmovd
+    __m256i vidx256 = _mm256_castsi128_si256(vidx);      // no instructions
+    __m256d shuffled = _mm256_permutevar4x64_pd(a, vidx256);
+    return _mm256_cvtsd_f64(shuffled);
+#else
+    alignas(32) double vec[4];
+    _mm256_store_pd(vec, a);
+    return vec[index];
+#endif
+  }
+
   template <int _cmp>
   static inline type cmp(type a, type b) {
     return _mm256_cmp_pd(a, b, _cmp);
@@ -232,11 +296,24 @@ struct simd<double> {
 };
 
 template <typename T>
-static uint64_t downsample0_simd(const T *in_x, const T *in_y,
-                                        uint64_t len, T *out_x, T *out_y,
-                                        uint64_t out_cap, int bucket_size) {
+static uint64_t downsample0_simd(const T *in_x, const T *in_y, uint64_t len,
+                                 T *out_x, T *out_y, uint64_t out_cap,
+                                 int bucket_size) {
+  constexpr bool enable_prefetching = true;
+
+  const int num_vecs_per_bucket = bucket_size / simd<T>::size;
+  constexpr int cacheline_size = 512 / 8;  // 512 bits = 64 byte
+  const int num_cachelines_per_bucket =
+      (bucket_size * sizeof(T)) / cacheline_size;
+  const int num_vecs_per_cacheline =
+      cacheline_size / (simd<T>::size * sizeof(T));
+
   if ((bucket_size % 8) != 0 || bucket_size <= 0) {
     throw std::invalid_argument("bucket_size not a positive multiple of 8");
+  }
+  if (((bucket_size * sizeof(T)) % cacheline_size) != 0) {
+    throw std::invalid_argument(
+        "bucket_size not a positive multiple of 64 byte (one cacheline)");
   }
   uint64_t num_full_buckets = (len - 2) / bucket_size;
   if (num_full_buckets + 2 > out_cap) {
@@ -278,10 +355,21 @@ static uint64_t downsample0_simd(const T *in_x, const T *in_y,
     vec_t next_y = simd<T>::zero();
     if (bi + 1 < num_full_buckets) {
       // Compute average of next bucket.
-      for (uint32_t si = 0; si < bucket_size; si += simd<T>::size) {
-        next_y = simd<T>::add(next_y, simd<T>::load(&in_y[bucket_size + si]));
+      for (uint32_t svi = 0; svi < num_vecs_per_bucket; ++svi) {
+        next_y = simd<T>::add(
+            next_y, simd<T>::load(&in_y[bucket_size + svi * simd<T>::size]));
         if (in_x) {
-          next_x = simd<T>::add(next_x, simd<T>::load(&in_x[bucket_size + si]));
+          next_x = simd<T>::add(
+              next_x, simd<T>::load(&in_x[bucket_size + svi * simd<T>::size]));
+        }
+
+        if constexpr (enable_prefetching) {
+          if ((svi % num_vecs_per_cacheline) == 0) {
+            const T *address =
+                &in_y[bucket_size +
+                      (svi + num_vecs_per_cacheline) * simd<T>::size];
+            _mm_prefetch(address, _MM_HINT_T1);
+          }
         }
       }
       if (in_x) {
@@ -307,19 +395,26 @@ static uint64_t downsample0_simd(const T *in_x, const T *in_y,
     vec_t v_largest_surface = simd<T>::zero();
     vec_t v_best_x = simd<T>::zero();
     vec_t v_best_y = simd<T>::zero();
-    for (uint32_t si = 0; si < bucket_size; si += simd<T>::size) {
+    for (uint32_t svi = 0; svi < num_vecs_per_bucket; ++svi) {
       // Take x,y coordinate of candidate
-      vec_t cand_y = simd<T>::load(&in_y[si]);
+      vec_t cand_y = simd<T>::load(&in_y[svi * simd<T>::size]);
       vec_t cand_x = simd<T>::zero();
       if (in_x) {
-        cand_x = simd<T>::load(&in_x[si]);
+        cand_x = simd<T>::load(&in_x[svi * simd<T>::size]);
       } else {
         if constexpr (sizeof(T) == 4) {
-          cand_x = simd<T>::splat(bi * bucket_size + si) +
+          cand_x = simd<T>::splat(bi * bucket_size + svi * simd<T>::size) +
                    simd<T>::load(ramp_f32_data);
         } else if constexpr (sizeof(T) == 8) {
-          cand_x = simd<T>::splat(bi * bucket_size + si) +
+          cand_x = simd<T>::splat(bi * bucket_size + svi * simd<T>::size) +
                    simd<T>::load(ramp_f64_data);
+        }
+      }
+
+      if constexpr (enable_prefetching) {
+        if ((svi % num_vecs_per_cacheline) == 0) {
+          _mm_prefetch(&in_y[(svi + num_vecs_per_cacheline) * simd<T>::size],
+                       _MM_HINT_T1);
         }
       }
 
@@ -346,33 +441,53 @@ static uint64_t downsample0_simd(const T *in_x, const T *in_y,
     }
 
     // Collapse vector into one final result
-    T best_x, best_y;
+    // 1) Find index of largest triangle
+#if 0
     T surfaces_array[simd<T>::size];
-    T best_x_array[simd<T>::size];
-    T best_y_array[simd<T>::size];
     T largest_surface = -1;
     typename simd<T>::signed_int indices_array[simd<T>::size];
     if constexpr (std::is_same_v<T, float> && simd<T>::size == 8) {
       _mm256_storeu_ps(surfaces_array, v_largest_surface);
-      _mm256_storeu_ps(best_x_array, v_best_x);
-      _mm256_storeu_ps(best_y_array, v_best_y);
-    } if constexpr (std::is_same_v<T, float> && simd<T>::size == 4) {
+    } else if constexpr (std::is_same_v<T, float> && simd<T>::size == 4) {
       _mm_storeu_ps(surfaces_array, v_largest_surface);
-      _mm_storeu_ps(best_x_array, v_best_x);
-      _mm_storeu_ps(best_y_array, v_best_y);
     } else if constexpr (sizeof(T) == sizeof(double)) {
       _mm256_storeu_pd(surfaces_array, v_largest_surface);
-      _mm256_storeu_pd(best_x_array, v_best_x);
-      _mm256_storeu_pd(best_y_array, v_best_y);
     }
+    int largest_surface_index = 0;
     for (int i = 0; i < simd<T>::size; ++i) {
       T s = surfaces_array[i];
       if (s >= largest_surface) {
         largest_surface = s;
-        best_x = best_x_array[i];
-        best_y = best_y_array[i];
+        largest_surface_index = i;
       }
     }
+#else
+    vec_t max_surface = simd<T>::hmax_vec(v_largest_surface);
+    int largest_surface_index =
+        simd<T>::index_of_match(v_largest_surface, max_surface);
+#endif
+
+    // 2) Get the corresponding coordinates
+    T best_x, best_y;
+#if 0
+    T best_x_array[simd<T>::size];
+    T best_y_array[simd<T>::size];
+    if constexpr (std::is_same_v<T, float> && simd<T>::size == 8) {
+      _mm256_storeu_ps(best_x_array, v_best_x);
+      _mm256_storeu_ps(best_y_array, v_best_y);
+    } else if constexpr (std::is_same_v<T, float> && simd<T>::size == 4) {
+      _mm_storeu_ps(best_x_array, v_best_x);
+      _mm_storeu_ps(best_y_array, v_best_y);
+    } else if constexpr (sizeof(T) == sizeof(double)) {
+      _mm256_storeu_pd(best_x_array, v_best_x);
+      _mm256_storeu_pd(best_y_array, v_best_y);
+    }
+    best_x = best_x_array[largest_surface_index];
+    best_y = best_y_array[largest_surface_index];
+#else
+    best_x = simd<T>::extract(v_best_x, largest_surface_index);
+    best_y = simd<T>::extract(v_best_y, largest_surface_index);
+#endif
 
     // Produce an output
     if (out_x) out_x[bi] = best_x;
@@ -407,26 +522,26 @@ static uint64_t downsample0_simd(const T *in_x, const T *in_y,
 
 uint64_t downsample(const float *x, const float *y, uint64_t len, float *out_x,
                     float *out_y, uint64_t out_cap, int bucket_size = -1) {
-  //ZoneScoped;
+  // ZoneScoped;
   return downsample0<float>(x, y, len, out_x, out_y, out_cap, bucket_size);
 }
 uint64_t downsample(const double *x, const double *y, uint64_t len,
                     double *out_x, double *out_y, uint64_t out_cap,
                     int bucket_size = -1) {
-  //ZoneScoped;
+  // ZoneScoped;
   return downsample0<double>(x, y, len, out_x, out_y, out_cap, bucket_size);
 }
 
 uint64_t downsample_simd(const float *x, const float *y, uint64_t len,
                          float *out_x, float *out_y, uint64_t out_cap,
                          int bucket_size = -1) {
-  //ZoneScoped;
+  // ZoneScoped;
   return downsample0_simd<float>(x, y, len, out_x, out_y, out_cap, bucket_size);
 }
 uint64_t downsample_simd(const double *x, const double *y, uint64_t len,
                          double *out_x, double *out_y, uint64_t out_cap,
                          int bucket_size = -1) {
-  //ZoneScoped;
+  // ZoneScoped;
   return downsample0_simd<double>(x, y, len, out_x, out_y, out_cap,
                                   bucket_size);
 }

@@ -189,11 +189,18 @@ TYPED_TEST(FastLTTB, Speedup10M_10Reps) {
     for (int bucket_size = 16; bucket_size < 1 << 16; bucket_size <<= 1) {
       double timing_simd = 0.0;
       double timing_scalar = 0.0;
+
+      double best_timing_simd = 10000.0;
+      double best_timing_scalar = 10000.0;
+
+      ZoneScopedN("BucketSize");
+      ZoneValue(bucket_size);
       {
         auto start = std::chrono::high_resolution_clock::now();
         ZoneScopedN("SIMD");
         for (int i = 0; i < reps; ++i) {
           ZoneScoped;
+          auto single_start = std::chrono::high_resolution_clock::now();
           int out_len;
           if (use_x != 0) {
             out_len = lttb::downsample_simd(test_x, test_y, num_samples, out_x,
@@ -202,6 +209,13 @@ TYPED_TEST(FastLTTB, Speedup10M_10Reps) {
             out_len = lttb::downsample_simd(nullptr, test_y, num_samples, out_x,
                                             out_y, len, bucket_size);
           }
+          auto single_stop = std::chrono::high_resolution_clock::now();
+          double timing = std::chrono::duration_cast<
+                              std::chrono::duration<double, std::milli>>(
+                              single_stop - single_start)
+                              .count();
+          best_timing_simd = std::min(best_timing_simd, timing);
+
           ASSERT_NE(out_len, 0);
         }
         auto stop = std::chrono::high_resolution_clock::now();
@@ -216,6 +230,7 @@ TYPED_TEST(FastLTTB, Speedup10M_10Reps) {
         ZoneScopedN("Scalar");
         for (int i = 0; i < reps; ++i) {
           ZoneScoped;
+          auto single_start = std::chrono::high_resolution_clock::now();
           int out_len;
           if (use_x != 0) {
             out_len = lttb::downsample(test_x, test_y, num_samples, out_x,
@@ -225,6 +240,12 @@ TYPED_TEST(FastLTTB, Speedup10M_10Reps) {
                                        out_y, len, bucket_size);
           }
           ASSERT_NE(out_len, 0);
+          auto single_stop = std::chrono::high_resolution_clock::now();
+          double timing = std::chrono::duration_cast<
+                              std::chrono::duration<double, std::milli>>(
+                              single_stop - single_start)
+                              .count();
+          best_timing_scalar = std::min(best_timing_scalar, timing);
         }
         auto stop = std::chrono::high_resolution_clock::now();
         timing_scalar =
@@ -234,11 +255,17 @@ TYPED_TEST(FastLTTB, Speedup10M_10Reps) {
             reps;
       }
 
+      // clang-format off
       std::printf(
-          "Speedup [bucket size %5d | %10s]: x%.2f  (simd=%8.2f ms; "
-          "scalar=%8.2f ms)\n",
+          "Speedup [bucket size %5d | %10s]: "
+            "<mean> x%.2f  (simd=%8.2f ms; scalar=%8.2f ms) "
+            "<best> x%.2f  (simd=%8.2f ms; scalar=%8.2f ms) "
+            "\n",
           bucket_size, use_x ? "with x" : "without x",
-          timing_scalar / timing_simd, timing_simd, timing_scalar);
+          timing_scalar / timing_simd, timing_simd, timing_scalar,
+          best_timing_scalar / best_timing_simd, best_timing_simd, best_timing_scalar
+          );
+      // clang-format on
     }
   }
 }
